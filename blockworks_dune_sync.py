@@ -6,7 +6,7 @@ Default behavior:
   2. Reads the persisted state CSV if it exists.
   3. Otherwise reads that dataset's historical seed CSV.
   4. Fetches the latest Blockworks execution and merges only new/recent dates.
-  5. Writes the updated state CSV.
+  5. Writes the updated state CSV in query-friendly long format.
   6. Uploads/replaces each Dune upload table with its full state CSV.
 
 GitHub Actions runners are ephemeral, so the workflow commits the updated state
@@ -23,8 +23,10 @@ import os
 import re
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -50,14 +52,15 @@ class DatasetConfig:
     description: str
     historical_csv: str
     state_csv: str
-    column_mode: str
+    dimension_column: str
+    series_mode: str
 
 
 @dataclass(frozen=True)
-class SeriesColumn:
+class ValueColumn:
     source_key: str
-    output_key: str
-    label: str
+    dimension_value: str
+    input_keys: tuple[str, ...]
 
 
 DATASETS: dict[str, DatasetConfig] = {
@@ -76,7 +79,8 @@ DATASETS: dict[str, DatasetConfig] = {
         ),
         historical_csv="data/historical_solana_spot_dex_volume_by_pair_category.csv",
         state_csv="data/solana_spot_dex_pair_category_volume.csv",
-        column_mode="label",
+        dimension_column="type",
+        series_mode="category_labels",
     ),
     "spot_volume_by_dex": DatasetConfig(
         key="spot_volume_by_dex",
@@ -93,7 +97,8 @@ DATASETS: dict[str, DatasetConfig] = {
         ),
         historical_csv="data/historical_solana_spot_volume_by_dex.csv",
         state_csv="data/solana_spot_volume_by_dex.csv",
-        column_mode="source",
+        dimension_column="dex",
+        series_mode="dex_totals",
     ),
 }
 
@@ -203,35 +208,48 @@ def dune_safe_name(value: str) -> str:
 
 
 def normalize_column_name(value: str) -> str:
-    if value == "block_date":
+    if value in {"block_date", "type", "dex", "volume"}:
         return value
     return dune_safe_name(value)
 
 
-def series_from_visualization(
+def dex_from_total_exchange_column(source_key: str) -> str | None:
+    match = re.fullmatch(r"total_exchange_(.+)_volume_usd", source_key)
+    if not match:
+        return None
+    return dune_safe_name(match.group(1))
+
+
+def value_columns_from_visualization(
     config: DatasetConfig,
     visualization: dict[str, Any],
-) -> list[SeriesColumn]:
+) -> list[ValueColumn]:
     groups = visualization["config"]["options"]["groups"]
     series_items = [item for group in groups for item in group["series"]]
-    output: list[SeriesColumn] = []
-    used_names: set[str] = set()
+    output: list[ValueColumn] = []
+    used_pairs: set[tuple[str, str]] = set()
 
     for item in series_items:
-        label = item["label"]
-        if config.column_mode == "source":
-            name = normalize_column_name(item["column"])
+        source_key = item["column"]
+
+        if config.series_mode == "dex_totals":
+            dimension_value = dex_from_total_exchange_column(source_key)
+            if dimension_value is None:
+                continue
+            input_keys = (source_key,)
+        elif config.series_mode == "category_labels":
+            dimension_value = dune_safe_name(item["label"])
+            input_keys = (source_key, f"{dimension_value}_volume_usd")
         else:
-            name = dune_safe_name(f"{label}_volume_usd")
+            raise ValueError(f"Unsupported series mode: {config.series_mode}")
 
-        original = name
-        suffix = 2
-        while name in used_names:
-            name = f"{original}_{suffix}"
-            suffix += 1
+        pair = (source_key, dimension_value)
+        if pair in used_pairs:
+            continue
 
-        used_names.add(name)
-        output.append(SeriesColumn(item["column"], name, label))
+        used_pairs.add(pair)
+        output.append(ValueColumn(source_key, dimension_value, input_keys))
+
     return output
 
 
@@ -261,62 +279,161 @@ def parse_block_date(value: Any) -> date | None:
         return None
 
 
-def read_seed_rows(path: Path, fieldnames: list[str]) -> list[dict[str, Any]]:
+def parse_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = Decimal(text)
+    except InvalidOperation:
+        return None
+    if not parsed.is_finite():
+        return None
+    return parsed
+
+
+def decimal_to_text(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def get_wide_value(source_row: dict[str, Any], value_column: ValueColumn) -> Any:
+    normalized_row = {
+        normalize_column_name(key): value
+        for key, value in source_row.items()
+        if key is not None
+    }
+
+    for input_key in value_column.input_keys:
+        if input_key in source_row:
+            return source_row[input_key]
+
+        normalized_key = normalize_column_name(input_key)
+        if normalized_key in normalized_row:
+            return normalized_row[normalized_key]
+
+    return None
+
+
+def aggregate_long_rows(
+    rows: list[dict[str, Any]],
+    *,
+    dimension_column: str,
+) -> list[dict[str, str]]:
+    totals: defaultdict[tuple[date, str], Decimal] = defaultdict(Decimal)
+
+    for row in rows:
+        parsed_date = parse_block_date(row.get("block_date"))
+        dimension_value = dune_safe_name(str(row.get(dimension_column, "")))
+        volume = parse_decimal(row.get("volume"))
+
+        if parsed_date is None or not dimension_value or volume is None:
+            continue
+
+        totals[(parsed_date, dimension_value)] += volume
+
+    return [
+        {
+            "block_date": block_date.isoformat(),
+            dimension_column: dimension_value,
+            "volume": decimal_to_text(volume),
+        }
+        for (block_date, dimension_value), volume in sorted(totals.items())
+    ]
+
+
+def read_seed_rows(
+    path: Path,
+    *,
+    dimension_column: str,
+    value_columns: list[ValueColumn],
+) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
-        rows: list[dict[str, Any]] = []
+        fieldnames = {normalize_column_name(name) for name in (reader.fieldnames or [])}
+        source_rows = list(reader)
 
-        for source_row in reader:
-            row = {fieldname: "" for fieldname in fieldnames}
-            for source_key, value in source_row.items():
-                if source_key is None:
-                    continue
-                target_key = normalize_column_name(source_key)
-                if target_key in row:
-                    row[target_key] = value
+    if {"block_date", dimension_column, "volume"}.issubset(fieldnames):
+        long_rows = [
+            {
+                "block_date": source_row.get("block_date", ""),
+                dimension_column: source_row.get(dimension_column, ""),
+                "volume": source_row.get("volume", ""),
+            }
+            for source_row in source_rows
+        ]
+        return aggregate_long_rows(long_rows, dimension_column=dimension_column)
 
-            row["block_date"] = normalize_block_date(row.get("block_date"))
-            if not row["block_date"]:
-                continue
-            rows.append(row)
+    long_rows: list[dict[str, Any]] = []
+    for source_row in source_rows:
+        block_date = normalize_block_date(source_row.get("block_date"))
+        if not block_date:
+            continue
 
-    return rows
+        for value_column in value_columns:
+            long_rows.append(
+                {
+                    "block_date": block_date,
+                    dimension_column: value_column.dimension_value,
+                    "volume": get_wide_value(source_row, value_column),
+                }
+            )
+
+    return aggregate_long_rows(long_rows, dimension_column=dimension_column)
 
 
 def build_fresh_rows(
     rows: list[dict[str, Any]],
-    series: list[SeriesColumn],
-) -> list[dict[str, Any]]:
-    output_rows: list[dict[str, Any]] = []
+    *,
+    dimension_column: str,
+    value_columns: list[ValueColumn],
+) -> list[dict[str, str]]:
+    long_rows: list[dict[str, Any]] = []
 
     for source_row in rows:
         block_date = normalize_block_date(source_row.get("block_date"))
         if not block_date:
             continue
 
-        output_rows.append(
-            {
-                "block_date": block_date,
-                **{column.output_key: source_row.get(column.source_key) for column in series},
-            }
-        )
+        for value_column in value_columns:
+            long_rows.append(
+                {
+                    "block_date": block_date,
+                    dimension_column: value_column.dimension_value,
+                    "volume": source_row.get(value_column.source_key),
+                }
+            )
 
-    return output_rows
+    return aggregate_long_rows(long_rows, dimension_column=dimension_column)
+
+
+def long_row_key(row: dict[str, Any], dimension_column: str) -> tuple[date, str] | None:
+    parsed = parse_block_date(row.get("block_date"))
+    dimension_value = dune_safe_name(str(row.get(dimension_column, "")))
+    if parsed is None or not dimension_value:
+        return None
+    return parsed, dimension_value
 
 
 def merge_rows(
-    existing_rows: list[dict[str, Any]],
-    fresh_rows: list[dict[str, Any]],
+    existing_rows: list[dict[str, str]],
+    fresh_rows: list[dict[str, str]],
     *,
+    dimension_column: str,
     refresh_lookback_days: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    rows_by_date: dict[date, dict[str, Any]] = {}
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    rows_by_key: dict[tuple[date, str], dict[str, str]] = {}
     for row in existing_rows:
-        parsed = parse_block_date(row.get("block_date"))
-        if parsed:
-            rows_by_date[parsed] = row
+        key = long_row_key(row, dimension_column)
+        if key:
+            rows_by_key[key] = row
 
-    max_existing_date = max(rows_by_date) if rows_by_date else None
+    existing_dates = {key[0] for key in rows_by_key}
+    max_existing_date = max(existing_dates) if existing_dates else None
     lookback_days = max(refresh_lookback_days, 0)
     refresh_cutoff = (
         max_existing_date - timedelta(days=lookback_days)
@@ -324,43 +441,45 @@ def merge_rows(
         else None
     )
 
-    added_dates = 0
-    refreshed_dates = 0
-    skipped_old_dates = 0
+    added_rows = 0
+    refreshed_rows = 0
+    skipped_old_rows = 0
 
     for row in fresh_rows:
-        parsed = parse_block_date(row.get("block_date"))
-        if parsed is None:
+        key = long_row_key(row, dimension_column)
+        if key is None:
             continue
 
+        block_date, _dimension_value = key
         should_merge = (
             max_existing_date is None
-            or parsed > max_existing_date
-            or (refresh_cutoff is not None and parsed >= refresh_cutoff)
+            or block_date > max_existing_date
+            or (refresh_cutoff is not None and block_date >= refresh_cutoff)
         )
         if not should_merge:
-            skipped_old_dates += 1
+            skipped_old_rows += 1
             continue
 
-        if parsed in rows_by_date:
-            refreshed_dates += 1
+        if key in rows_by_key:
+            refreshed_rows += 1
         else:
-            added_dates += 1
-        rows_by_date[parsed] = row
+            added_rows += 1
+        rows_by_key[key] = row
 
-    merged_rows = [rows_by_date[key] for key in sorted(rows_by_date)]
+    merged_rows = [rows_by_key[key] for key in sorted(rows_by_key)]
+    merged_dates = {key[0] for key in rows_by_key}
     stats = {
-        "added_dates": added_dates,
+        "added_rows": added_rows,
         "existing_max_date": max_existing_date.isoformat() if max_existing_date else None,
-        "merged_max_date": max(rows_by_date).isoformat() if rows_by_date else None,
-        "refreshed_dates": refreshed_dates,
+        "merged_max_date": max(merged_dates).isoformat() if merged_dates else None,
+        "refreshed_rows": refreshed_rows,
         "refresh_lookback_days": lookback_days,
-        "skipped_old_dates": skipped_old_dates,
+        "skipped_old_rows": skipped_old_rows,
     }
     return merged_rows, stats
 
 
-def rows_to_csv(rows: list[dict[str, Any]], fieldnames: list[str]) -> str:
+def rows_to_csv(rows: list[dict[str, str]], fieldnames: list[str]) -> str:
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=fieldnames, lineterminator="\n")
     writer.writeheader()
@@ -430,15 +549,28 @@ def sync_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, A
     query_id = str(visualization.get("queryId") or config.default_query_id)
     execution_id = latest_execution_id(config, query_id, visualization.get("lastExecutionId"))
     source_rows = fetch_execution_rows(config, execution_id)
-    series = series_from_visualization(config, visualization)
-    fieldnames = ["block_date", *(column.output_key for column in series)]
+    value_columns = value_columns_from_visualization(config, visualization)
+    fieldnames = ["block_date", config.dimension_column, "volume"]
 
     seed_csv, seed_source = choose_seed_csv(config, args)
-    existing_rows = [] if seed_source == "empty_seed" else read_seed_rows(seed_csv, fieldnames)
-    fresh_rows = build_fresh_rows(source_rows, series)
+    existing_rows = (
+        []
+        if seed_source == "empty_seed"
+        else read_seed_rows(
+            seed_csv,
+            dimension_column=config.dimension_column,
+            value_columns=value_columns,
+        )
+    )
+    fresh_rows = build_fresh_rows(
+        source_rows,
+        dimension_column=config.dimension_column,
+        value_columns=value_columns,
+    )
     merged_rows, merge_stats = merge_rows(
         existing_rows,
         fresh_rows,
+        dimension_column=config.dimension_column,
         refresh_lookback_days=args.refresh_lookback_days,
     )
     csv_text = rows_to_csv(merged_rows, fieldnames)
@@ -449,9 +581,11 @@ def sync_dataset(config: DatasetConfig, args: argparse.Namespace) -> dict[str, A
     result: dict[str, Any] = {
         "csv_bytes": len(csv_text.encode("utf-8")),
         "dataset": config.key,
+        "dimension_column": config.dimension_column,
         "dune_table_name": config.table_name,
         "execution_id": execution_id,
         "fresh_source_row_count": len(source_rows),
+        "fresh_long_row_count": len(fresh_rows),
         "merged_row_count": len(merged_rows),
         "query_id": query_id,
         "seed_csv": str(seed_csv),

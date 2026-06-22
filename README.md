@@ -3,12 +3,14 @@
 This workflow uses already-scraped historical CSVs as seeds, then updates the
 datasets every 24 hours with GitHub Actions.
 
+Both Dune tables are stored in long format so they are easy to query.
+
 ## Datasets
 
-| Dataset key | Blockworks chart | State CSV | Dune table |
-| --- | --- | --- | --- |
-| `pair_category` | Solana: Spot DEX Volume by Pair Category | `data/solana_spot_dex_pair_category_volume.csv` | `solana_spot_dex_pair_category_volume` |
-| `spot_volume_by_dex` | Solana: Spot Volume by DEX | `data/solana_spot_volume_by_dex.csv` | `solana_spot_volume_by_dex` |
+| Dataset key | Blockworks chart | State CSV | Dune table | Columns |
+| --- | --- | --- | --- | --- |
+| `pair_category` | Solana: Spot DEX Volume by Pair Category | `data/solana_spot_dex_pair_category_volume.csv` | `solana_spot_dex_pair_category_volume` | `block_date`, `type`, `volume` |
+| `spot_volume_by_dex` | Solana: Spot Volume by DEX | `data/solana_spot_volume_by_dex.csv` | `solana_spot_volume_by_dex` | `block_date`, `dex`, `volume` |
 
 Historical seed CSVs:
 
@@ -41,9 +43,9 @@ Each run merges only:
 - dates newer than the current max `block_date`
 - dates inside `REFRESH_LOOKBACK_DAYS`, default `7`, to catch late source updates
 
-Blockworks' row endpoint returns a current execution snapshot, so the script
-still fetches that snapshot, but it does not replace full history with a fresh
-scrape.
+The DEX table uses Blockworks' `total_exchange_*` columns only, because the same
+chart also contains prop-AMM and orderbook subgroup columns that would double
+count volume if summed with totals.
 
 ## Local Test
 
@@ -85,59 +87,18 @@ Uploading the same table name replaces the table contents with the current
 maintained CSV. Dune exposes uploaded tables as:
 
 ```sql
-select *
+select block_date, type, volume
 from dune.<team_or_user_handle>.dataset_solana_spot_dex_pair_category_volume;
 
-select *
+select block_date, dex, volume
 from dune.<team_or_user_handle>.dataset_solana_spot_volume_by_dex;
 ```
 
-## Pair-Category Columns
+Example daily totals:
 
-- `block_date`
-- `sol_stablecoin_volume_usd`
-- `stablecoin_swaps_volume_usd`
-- `foreign_tokens_volume_usd`
-- `lst_swaps_volume_usd`
-- `composites_volume_usd`
-- `tokenized_assets_volume_usd`
-- `project_tokens_volume_usd`
-- `memes_volume_usd`
-
-## Spot-Volume-by-DEX Columns
-
-- `block_date`
-- `total_exchange_humidifi_volume_usd`
-- `total_exchange_orca_volume_usd`
-- `total_exchange_bisonfi_volume_usd`
-- `total_exchange_zerofi_volume_usd`
-- `total_exchange_solfi_volume_usd`
-- `total_exchange_tessera_volume_usd`
-- `total_exchange_pump_volume_usd`
-- `total_exchange_raydium_volume_usd`
-- `total_exchange_meteora_volume_usd`
-- `total_exchange_goonfi_volume_usd`
-- `total_exchange_jupiterz_volume_usd`
-- `total_exchange_alphaq_volume_usd`
-- `total_exchange_manifest_volume_usd`
-- `total_exchange_obric_volume_usd`
-- `total_exchange_phoenix_volume_usd`
-- `total_exchange_aquifer_volume_usd`
-- `total_exchange_scorch_volume_usd`
-- `total_exchange_lifinity_volume_usd`
-- `total_exchange_other_volume_usd`
-- `type_propamm_exchange_humidifi_volume_usd`
-- `type_propamm_exchange_tessera_volume_usd`
-- `type_propamm_exchange_bisonfi_volume_usd`
-- `type_propamm_exchange_solfi_volume_usd`
-- `type_propamm_exchange_zerofi_volume_usd`
-- `type_propamm_exchange_goonfi_volume_usd`
-- `type_propamm_exchange_alphaq_volume_usd`
-- `type_propamm_exchange_scorch_volume_usd`
-- `type_propamm_exchange_obric_volume_usd`
-- `type_propamm_exchange_rubicon_volume_usd`
-- `type_propamm_exchange_aquifer_volume_usd`
-- `type_propamm_exchange_lifinity_volume_usd`
-- `type_propamm_exchange_obsidian_volume_usd`
-- `type_orderbook_exchange_manifest_volume_usd`
-- `type_orderbook_exchange_phoenix_volume_usd`
+```sql
+select block_date, sum(volume) as volume
+from dune.<team_or_user_handle>.dataset_solana_spot_volume_by_dex
+group by 1
+order by 1;
+```
