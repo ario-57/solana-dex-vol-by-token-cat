@@ -174,12 +174,16 @@ def latest_execution_id(
     query_id: str,
     fallback_execution_id: str | None = None,
 ) -> str:
-    query = urlencode({"query_id": query_id, "limit": 1, "page": 1, "state": "success"})
+    query = urlencode({"query_id": query_id, "limit": 25, "page": 1, "state": "success"})
     url = f"{BLOCKWORKS_REST_API}/v1/internal/studio/queries/executions?{query}"
     payload = request_json(url, page_url=config.page_url)
     executions = payload.get("data") or []
     if executions:
-        return executions[0]["execution_id"]
+        newest_execution = max(
+            executions,
+            key=lambda execution: int(execution.get("updated_at") or 0),
+        )
+        return newest_execution["execution_id"]
     if fallback_execution_id:
         return fallback_execution_id
     raise RuntimeError(f"No successful Blockworks execution found for query_id={query_id}")
