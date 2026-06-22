@@ -1,0 +1,49 @@
+name: Blockworks to Dune Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Runs once per day at 02:15 UTC.
+    - cron: "15 2 * * *"
+
+concurrency:
+  group: blockworks-dune-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run sync
+        env:
+          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+          DUNE_TABLE_NAME: solana_spot_dex_pair_category_volume
+          DUNE_IS_PRIVATE: "false"
+          BLOCKWORKS_QUERY_ID: "3056"
+          HISTORICAL_CSV: data/historical_solana_spot_dex_volume_by_pair_category.csv
+          STATE_CSV: data/solana_spot_dex_pair_category_volume.csv
+          REFRESH_LOOKBACK_DAYS: "7"
+        run: python blockworks_dune_sync.py
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/solana_spot_dex_pair_category_volume.csv
+          if git diff --cached --quiet; then
+            echo "No CSV changes to commit."
+          else
+            git commit -m "Update Blockworks Dune CSV"
+            git push
+          fi
