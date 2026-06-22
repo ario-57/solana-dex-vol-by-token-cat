@@ -1,5 +1,6 @@
 name: Blockworks to Dune Sync
 
+# Daily CSV maintenance and Dune upload.
 on:
   workflow_dispatch:
   schedule:
