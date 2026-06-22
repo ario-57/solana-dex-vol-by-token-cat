@@ -104,5 +104,3 @@ from dune.<team_or_user_handle>.dataset_solana_spot_dex_pair_category_volume
 - `tokenized_assets_volume_usd`
 - `project_tokens_volume_usd`
 - `memes_volume_usd`
-- `source_execution_id`
-- `scraped_at_utc`

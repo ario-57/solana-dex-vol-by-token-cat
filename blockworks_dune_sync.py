@@ -23,7 +23,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -51,9 +51,6 @@ HTTP_HEADERS = {
         "AppleWebKit/537.36 Chrome/125 Safari/537.36"
     ),
 }
-
-METADATA_FIELDS = ["source_execution_id", "scraped_at_utc"]
-
 
 @dataclass(frozen=True)
 class SeriesColumn:
@@ -155,7 +152,7 @@ def dune_safe_name(value: str) -> str:
 
 
 def normalize_column_name(value: str) -> str:
-    if value in {"block_date", *METADATA_FIELDS}:
+    if value == "block_date":
         return value
     return dune_safe_name(value)
 
@@ -222,8 +219,6 @@ def read_seed_rows(path: Path, fieldnames: list[str]) -> list[dict[str, Any]]:
             row["block_date"] = normalize_block_date(row.get("block_date"))
             if not row["block_date"]:
                 continue
-            if not row["source_execution_id"]:
-                row["source_execution_id"] = "historical_csv"
             rows.append(row)
 
     return rows
@@ -232,10 +227,7 @@ def read_seed_rows(path: Path, fieldnames: list[str]) -> list[dict[str, Any]]:
 def build_fresh_rows(
     rows: list[dict[str, Any]],
     series: list[SeriesColumn],
-    *,
-    execution_id: str,
 ) -> list[dict[str, Any]]:
-    scraped_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     output_rows: list[dict[str, Any]] = []
 
     for source_row in rows:
@@ -247,8 +239,6 @@ def build_fresh_rows(
             {
                 "block_date": block_date,
                 **{column.output_key: source_row.get(column.source_key) for column in series},
-                "source_execution_id": execution_id,
-                "scraped_at_utc": scraped_at,
             }
         )
 
@@ -384,12 +374,11 @@ def sync_once(args: argparse.Namespace) -> dict[str, Any]:
     fieldnames = [
         "block_date",
         *(column.output_key for column in series),
-        *METADATA_FIELDS,
     ]
 
     seed_csv, seed_source = choose_seed_csv(args)
     existing_rows = [] if seed_source == "empty_seed" else read_seed_rows(seed_csv, fieldnames)
-    fresh_rows = build_fresh_rows(source_rows, series, execution_id=execution_id)
+    fresh_rows = build_fresh_rows(source_rows, series)
     merged_rows, merge_stats = merge_rows(
         existing_rows,
         fresh_rows,
