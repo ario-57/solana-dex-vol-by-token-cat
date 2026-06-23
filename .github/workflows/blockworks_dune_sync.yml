@@ -3,8 +3,8 @@ name: Blockworks to Dune Sync
 on:
   workflow_dispatch:
   schedule:
-    # Runs once per day at 02:15 UTC.
-    - cron: "15 2 * * *"
+    # Runs once per day at 15:00 Turkey time (12:00 UTC).
+    - cron: "0 12 * * *"
 
 concurrency:
   group: blockworks-dune-sync

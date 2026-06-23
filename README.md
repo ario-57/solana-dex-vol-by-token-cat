@@ -27,7 +27,8 @@ Maintained state CSVs:
 1. Add a repository secret named `DUNE_API_KEY`.
 2. Keep the historical seed CSVs committed to the repo.
 3. The workflow in `.github/workflows/blockworks_dune_sync.yml` runs daily at
-   `02:15 UTC` and can also be run manually from the Actions tab.
+   `15:00 Turkey time` (`12:00 UTC`) and can also be run manually from the
+   Actions tab.
 
 The action uploads both maintained CSVs to Dune, then commits any updated CSVs
 back to the repo.
